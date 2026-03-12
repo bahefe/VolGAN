@@ -1,0 +1,226 @@
+Yes — the best way to audit the Codex implementation is to force it to explain the paper at the level of **state variables, conditioning, objective terms, and post-processing**. For VolGAN, the biggest implementation failure modes are: using the wrong target variable, skipping the custom smoothness penalties, misunderstanding the arbitrage handling, or evaluating only visually instead of with the paper’s diagnostics. The paper/presentation indicate that VolGAN is a conditional GAN on **next-day underlying return + next-day implied-vol surface increment**, conditioned on the **previous surface, two previous underlying log-returns, and one-month realized volatility**, with a **custom generator loss** and a **separate arbitrage-penalty reweighting step** after sampling. ([Bayes Business School][1])
+
+Here are the questions I would ask the agent.
+
+## 1) Make it restate the exact learning problem
+
+1. **What exactly is the model learning to generate?**
+   You want it to answer something like: “the next-day underlying log-return and the next-day implied-volatility surface, or equivalently the surface increment in log-implied-vol coordinates.” If it says it predicts prices directly, or raw option prices only, that is already off. ([Bayes Business School][1])
+
+2. **Are you representing the surface in raw implied vol, log implied vol, or increments of log implied vol? Why?**
+   The presentation defines ( g_t(m,\tau)=\log \sigma_t(m,\tau) ) and ( \Delta g_t = g_{t+1}-g_t ). If the implementation works directly on raw vols everywhere, ask why it deviates. ([Bayes Business School][1])
+
+3. **What is the conditioning variable (a_t) in your code, exactly? List every component and tensor shape.**
+   The paper presentation says the inputs are the two previous underlying log-returns, one-month realized volatility, and the implied-vol surface at the previous date. ([Bayes Business School][1])
+
+4. **What is the prediction horizon in your implementation — one day or something else?**
+   VolGAN is framed as learning next-day dynamics. If the agent used multi-step forecasting during training without saying so, that is a meaningful departure. ([Bayes Business School][1])
+
+5. **What grid are you generating on?**
+   Ask for the exact moneyness/maturity grid, whether it is fixed across dates, and how missing market quotes are handled before training.
+
+---
+
+## 2) Force it to explain the data preprocessing
+
+6. **How do you build the implied-volatility surface from market quotes before giving it to the GAN?**
+   The SPX experiment in the presentation uses a **Nadaraya–Watson kernel smoothing** of OptionMetrics implied vol data. If your agent skipped surface construction details or used a very different interpolation/smoothing scheme, that matters. ([Bayes Business School][1])
+
+7. **What is your definition of moneyness (m)?**
+   Ask whether it is log-moneyness, normalized strike, or something else. This matters because the smoothness penalties are defined along the surface grid in (m) and (\tau).
+
+8. **How do you compute the one-month realized volatility input?**
+   The presentation shows a realized-volatility definition based on recent returns. Ask for the exact formula and window used in code. ([Bayes Business School][1])
+
+9. **Are you normalizing returns, vol levels, and surface increments? If yes, how?**
+   Ask for feature-wise normalization, train/test split logic, and whether normalization is fitted on train only.
+
+10. **How do you align the underlying return timestamp with the surface timestamp?**
+    This catches subtle off-by-one errors.
+
+---
+
+## 3) Check the architecture, not just “GAN” in name
+
+11. **Show me the generator architecture layer by layer, including dimensions, activations, and where the condition is concatenated.**
+    The available text indicates a feed-forward generator with Gaussian latent noise and a small architecture; if the agent used an LSTM, Transformer, or diffusion model “because it seemed better,” that is no longer a faithful VolGAN implementation. ([cdn.wallstreetscholars.com][2])
+
+12. **What is the latent noise dimension (d)?**
+    The accessible paper text says standard i.i.d. Gaussian noise with dimension **32**. ([cdn.wallstreetscholars.com][2])
+
+13. **What are the hidden sizes of generator and discriminator?**
+    The accessible text says the first layer has **H = 16**, second layer **2H = 32**, and the discriminator is a two-layer feed-forward net with hidden size **16** and scalar output. ([cdn.wallstreetscholars.com][2])
+
+14. **What activation functions are you using in generator and discriminator, and why?**
+    The available text mentions softplus and sigmoid in the discriminator. ([cdn.wallstreetscholars.com][2])
+
+15. **Does the generator emit the whole surface increment in one shot plus the return, or does it generate them separately?**
+    The paper frames the output jointly, which is important because the goal is to capture co-movements. ([Taylor & Francis Online][3])
+
+16. **How do you ensure the discriminator sees the same condition as the generator?**
+    If the discriminator is not conditional, that is wrong.
+
+---
+
+## 4) Audit the loss carefully — this is the heart of the paper
+
+17. **Write the exact generator loss you implemented, term by term.**
+    Ask it to print the math and map each term to code. VolGAN is not just BCE GAN; it adds **smoothness penalties** on the generated surface. ([ResearchGate][4])
+
+18. **Did you include both smoothness penalties: one along moneyness and one along maturity?**
+    The presentation defines discrete Sobolev-type penalties (L_m(g)) and (L_\tau(g)). Missing either one is a red flag. ([Bayes Business School][1])
+
+19. **Are your smoothness penalties applied to the generated surface level (g_t) or to the generated increment (\Delta g_t)?**
+    This is the kind of detail that often gets implemented incorrectly.
+
+20. **How are the coefficients (\alpha_m) and (\alpha_\tau) chosen?**
+    The accessible text says they are selected by **gradient norm matching**, after first training for **25 epochs** with BCE only and then comparing gradient norms of BCE, (L_m), and (L_\tau). ([cdn.wallstreetscholars.com][2])
+
+21. **Did you actually do the warm-up phase with BCE-only training before setting (\alpha_m,\alpha_\tau)?**
+    If not, ask what replaced it and why.
+
+22. **Is the discriminator trained with standard binary cross-entropy, or did you change the adversarial loss?**
+    The presentation says the discriminator is trained classically with BCE. ([Bayes Business School][1])
+
+23. **Did you include any additional losses not in the paper, such as MSE reconstruction loss, WGAN-GP, spectral normalization, gradient penalty, or feature matching?**
+    Good question because Codex may add “stabilizers” that change the method substantially.
+
+---
+
+## 5) Check the arbitrage treatment — this is where people usually get it wrong
+
+24. **How do you handle static arbitrage: inside training, after generation, or both?**
+    The presentation is very clear that a core component is **arbitrage-penalty scenario reweighting**, i.e. a change of measure applied to generated scenarios, not simply hard projection inside the forward pass. ([Bayes Business School][1])
+
+25. **What is your arbitrage penalty function (\Phi(\sigma))?**
+    Ask for the exact formula and what violations it penalizes. It should correspond to static no-arbitrage violations on the surface, not a vague “negative vols are bad” penalty.
+
+26. **Did you implement the reweighting step ( w_i \propto \exp(-\beta \Phi(\hat{\sigma}_i)) )?**
+    The presentation explicitly gives this weighted Monte Carlo reweighting formula. If the agent says “I filtered out bad samples” instead, that is not the same method. ([Bayes Business School][1])
+
+27. **Where in the pipeline do you apply reweighting?**
+    The right answer is after drawing a batch of scenarios from the generator, computing each scenario’s arbitrage penalty, and assigning normalized importance weights. ([Bayes Business School][1])
+
+28. **What value(s) of (\beta) did you use, and how sensitive are results to (\beta)?**
+    The model has raw outputs and reweighted outputs; both should be inspectable.
+
+29. **Did you accidentally backpropagate through the reweighting distribution during GAN training?**
+    Ask this explicitly. The reweighting step is conceptually separate; if they fused it badly into training, you want to know.
+
+30. **Do you report metrics both before and after reweighting?**
+    The presentation compares raw VolGAN vs reweighted VolGAN, especially on arbitrage penalty. ([Bayes Business School][1])
+
+---
+
+## 6) Make it prove the implementation with the paper’s diagnostics
+
+31. **Show me the arbitrage penalty statistics for train/test data, raw generator output, and reweighted output.**
+    The presentation reports, for SPX test data, mean arbitrage penalty roughly:
+    data **0.0096**, BCE GAN **2.4635**, raw VolGAN **0.0199**, reweighted VolGAN **0.0127**. You do not need the exact same numbers unless using the same data/pipeline, but you should see the same ordering and the same qualitative result. ([Bayes Business School][1])
+
+32. **Did you compare generated principal components of daily log-IV increments against the real data?**
+    The paper evaluates whether VolGAN reproduces the classic first three PCs: level, skew, curvature. ([Bayes Business School][1])
+
+33. **What do your first three PCs represent economically, and do they line up with level / skew / curvature?**
+    If the agent cannot answer, it may not have done the correct evaluation.
+
+34. **What are the inner products between real and generated PCs?**
+    The presentation reports approximately **0.921**, **0.921**, **0.798** for the first three. Again, not exact replication, but directionally similar behavior is expected. ([Bayes Business School][1])
+
+35. **How much variance do the top PCs explain in real vs generated increments?**
+    The presentation shows real data around **51.25%**, **34.00%**, **5.01%**, versus VolGAN around **45.31%**, **25.69%**, **12.76%**. ([Bayes Business School][1])
+
+36. **Did you evaluate correlations between underlying returns and the IV PCs?**
+    The presentation explicitly checks this joint structure. ([Bayes Business School][1])
+
+37. **Did you evaluate correlations between underlying returns, ATM implied-vol increments, the level factor, and VIX/log-VIX?**
+    The model is supposed to capture joint dynamics of the surface, underlying, and VIX. ([Taylor & Francis Online][3])
+
+38. **Can your implementation reproduce time-varying correlations rather than only a constant average correlation?**
+    The presentation highlights time-varying correlations as a key outcome. ([Taylor & Francis Online][3])
+
+39. **What do the simulated distributions of ATM vol increments look like?**
+    The presentation says they exhibit asymmetric, exponentially decaying tails; if the implementation outputs nearly Gaussian increments, something is off. ([Bayes Business School][1])
+
+40. **Are the realized next-day observations typically inside the simulated prediction intervals?**
+    The presentation inspects whether realized values fall in the range of generated scenarios. ([Bayes Business School][1])
+
+---
+
+## 7) Ask code-level audit questions that expose fake fidelity
+
+41. **Point me to the exact function where (g_t=\log \sigma_t) is defined and where (\Delta g_t) is constructed.**
+
+42. **Point me to the exact function where the condition vector is built. Print one sample with names and shapes.**
+
+43. **Point me to the exact generator-loss function and annotate which lines implement BCE, (L_m), and (L_\tau).**
+
+44. **Point me to the exact function computing the arbitrage penalty (\Phi). What finite-difference formulas does it use?**
+
+45. **Point me to the exact function implementing scenario reweighting. Show that weights are normalized and depend on (\exp(-\beta \Phi)).**
+
+46. **Show me one end-to-end example: input condition → 10,000 generated scenarios → arbitrage penalties → reweighted expectations / quantiles.**
+    That last piece mirrors the way the paper discusses reweighted outputs. ([Bayes Business School][1])
+
+47. **Did you accidentally use a deterministic generator at inference by fixing or omitting the latent noise?**
+    That would destroy the scenario-generation purpose.
+
+48. **How many scenarios do you draw per condition during evaluation?**
+    The presentation discusses statistics based on large generated samples and mentions averages corresponding to **10,000 samples** for some arbitrage summaries. ([Bayes Business School][1])
+
+49. **Is the test period genuinely out-of-sample and several years after training, including stressed periods?**
+    The presentation emphasizes out-of-sample checks several years after training, including Covid-era behavior. ([Bayes Business School][1])
+
+50. **If your implementation differs from the paper, list every deviation explicitly and justify each one.**
+    This is the single best anti-handwaving question.
+
+---
+
+## 8) Questions that test whether the agent actually understands the paper
+
+51. **Why does VolGAN penalize surface roughness in m and τ instead of just post-smoothing the generator output?**
+
+52. **Why is arbitrage handled by reweighting scenarios rather than simply projecting every generated surface onto an arbitrage-free set?**
+
+53. **Why is joint generation of returns and surface dynamics important for option risk management?**
+
+54. **Why is reproducing principal components of IV increments a stronger diagnostic than matching only marginal vol distributions?**
+
+55. **What would visually plausible but incorrect output look like?**
+    The presentation even shows that a vanilla BCE GAN can produce output that clearly “doesn’t look realistic.” ([Bayes Business School][1])
+
+56. **What would be the consequence of training on levels instead of increments?**
+
+57. **What would break if the condition omitted realized volatility or recent returns?**
+
+58. **What specifically makes VolGAN better suited than a Gaussian factor model for this task?**
+    A good answer should mention non-Gaussian increments and time-varying correlations. ([Taylor & Francis Online][3])
+
+---
+
+## 9) A compact “pass/fail” prompt you can send directly
+
+You can send this almost verbatim to the agent:
+
+> Explain my VolGAN implementation as if you were defending it in a code review.
+>
+> 1. Define the state variables, including whether you model (g_t=\log\sigma_t), (\Delta g_t), and (R_t).
+> 2. List the exact conditioning inputs and tensor shapes.
+> 3. Show the exact generator and discriminator architectures, latent dimension, hidden sizes, and activations.
+> 4. Write the exact generator and discriminator losses, including BCE and the smoothness penalties in m and τ.
+> 5. Explain how (\alpha_m,\alpha_\tau) are chosen and whether you used the BCE warm-up / gradient-norm matching procedure.
+> 6. Define the arbitrage penalty (\Phi) and show the code implementing scenario reweighting (w_i \propto \exp(-\beta\Phi_i)).
+> 7. Show evaluation results for arbitrage penalties, PCA of daily log-IV increments, correlations with returns and VIX, time-varying correlations, and ATM-vol increment distributions.
+> 8. List every deviation from the paper and justify it.
+
+That prompt forces it to either reveal a faithful implementation or expose where it improvised.
+
+The cleanest way to use these is to ask the agent for a **paper-to-code mapping table** with columns:
+**paper concept / equation / code file / function / tensor shape / verified?**
+
+That usually surfaces mistakes immediately.
+
+[1]: https://www.bayes.citystgeorges.ac.uk/__data/assets/pdf_file/0005/870287/VolGAN_Pres_NoAppendix.pdf "VolGAN: a generative model for arbitrage-free implied volatility surfaces"
+[2]: https://cdn.wallstreetscholars.com/upload/2024-A-generative-Model-for-Arbitrage.pdf?utm_source=chatgpt.com "a generative model for arbitrage-free implied volatility surfaces"
+[3]: https://www.tandfonline.com/doi/abs/10.1080/1350486X.2025.2471317?utm_source=chatgpt.com "A Generative Model for Arbitrage-Free Implied Volatility ..."
+[4]: https://www.researchgate.net/publication/376010423_VolGAN_a_generative_model_for_arbitrage-free_implied_volatility_surfaces?utm_source=chatgpt.com "VolGAN: a generative model for arbitrage-free implied ..."
