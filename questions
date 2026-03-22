@@ -224,3 +224,158 @@ That usually surfaces mistakes immediately.
 [2]: https://cdn.wallstreetscholars.com/upload/2024-A-generative-Model-for-Arbitrage.pdf?utm_source=chatgpt.com "a generative model for arbitrage-free implied volatility surfaces"
 [3]: https://www.tandfonline.com/doi/abs/10.1080/1350486X.2025.2471317?utm_source=chatgpt.com "A Generative Model for Arbitrage-Free Implied Volatility ..."
 [4]: https://www.researchgate.net/publication/376010423_VolGAN_a_generative_model_for_arbitrage-free_implied_volatility_surfaces?utm_source=chatgpt.com "VolGAN: a generative model for arbitrage-free implied ..."
+
+Yes—here is a strong review checklist you can give your coding agent. It is designed to flush out exactly the implementation ambiguities we discussed: generator target, smoothness term placement, gradient norm matching, scenario re-weighting, β calibration, forecasting usage, and preprocessing. The questions below are grounded in the paper’s Sections 3 and 4. 
+
+## Core state and targets
+
+1. **Are you training on log-implied vol surfaces (g_t=\log \sigma_t), not raw implied vols?** The paper defines the state in log-vol space and the generator outputs log-vol increments, not levels. 
+
+2. **Does the generator output ((\hat R_t, \Delta \hat g_t)), not ((\hat R_t, \hat g_t))?** This is one of the easiest places to implement the wrong target. 
+
+3. **When reconstructing the next-day surface, are you using**
+   [
+   \hat g_{t+\Delta t}=g_t+\Delta \hat g_t
+   ]
+   **and then exponentiating only if you need implied vols?** 
+
+4. **Is the condition vector exactly**
+   [
+   a_t=(R_{t-\Delta t},R_{t-2\Delta t},\gamma_{t-\Delta t},g_t(m,\tau))?
+   ]
+   **No extra lag, no missing realized vol term, no raw vol instead of log-vol?** 
+
+5. **Is realized volatility (\gamma_t) implemented as the one-month realized vol from the previous 21 trading days exactly as in equation (8)?** 
+
+## Generator/discriminator losses
+
+6. **Is the generator BCE term implemented as (-\frac12 \mathbb E[\log D(a_t,G(a_t,z_t))]), not the discriminator loss and not a symmetric GAN loss?** 
+
+7. **Are the smoothness penalties applied to the reconstructed surface**
+   [
+   g_t + G(a_t,z_t)|*{2:},
+   ]
+   **not just to the increment (G(a_t,z_t)|*{2:})?** This was one of the biggest confusion points. 
+
+8. **Did you implement (L_m) and (L_\tau) as finite-difference Sobolev seminorms on the grid, with squared first differences divided by squared grid spacing?** 
+
+9. **Are expectations over (z_t \sim N(0,I_d)) approximated by minibatch averages of Gaussian noise samples?** 
+
+10. **Is the discriminator trained on real pairs ((R_t,\Delta g_t)) versus fake pairs (G(a_t,z_t)), conditional on the same (a_t)?** 
+
+## Gradient norm matching for (\alpha_m,\alpha_\tau)
+
+11. **Did you include a separate 25-epoch calibration phase using BCE-only training before full training?** The paper does not pick (\alpha_m,\alpha_\tau) by hand. 
+
+12. **During that 25-epoch phase, are you logging the gradient norms with respect to generator parameters (\theta_g) for each of the three terms separately: BCE, (L_m), and (L_\tau)?** 
+
+13. **Are (\alpha_m) and (\alpha_\tau) computed as the mean ratio**
+    [
+    \alpha_m \approx \text{mean}\left(\frac{|\nabla_{\theta_g}\text{BCE}|}{|\nabla_{\theta_g}L_m|}\right),\quad
+    \alpha_\tau \approx \text{mean}\left(\frac{|\nabla_{\theta_g}\text{BCE}|}{|\nabla_{\theta_g}L_\tau|}\right)?
+    ]
+    **Or did you accidentally match loss values instead of gradient norms?** 
+
+14. **After the gradient-matching phase, do you restart training from the same initialization used at the start of that phase, rather than continuing from the partially trained BCE-only model?** The paper explicitly says they restart. 
+
+15. **If your log says “25 epochs but ~1000 updates,” is that because you correctly distinguish epochs from minibatch steps?** This should be explainable from dataset size and batch size, not treated as a bug. 
+
+## Main numerical implementation
+
+16. **Is the generator a 3-layer feedforward dense network with softplus, softplus, affine output, noise dimension (d=32), hidden sizes (H=16) then (2H=32)?** 
+
+17. **Is the discriminator a 2-layer feedforward net with softplus then sigmoid, hidden size (H=16), output size 1?** 
+
+18. **Are you using RMSProp with learning rate 0.0001 for both networks?** 
+
+19. **Is training alternating one discriminator update per generator update?** 
+
+20. **Is minibatch size 100?** 
+
+## Scenario re-weighting
+
+21. **Is scenario re-weighting implemented as a post-processing step after generation, not as a modification of generator training?** The paper trains the GAN first, then reweights generated scenarios. 
+
+22. **Given (N) generated scenarios ((\hat R_i,\hat \sigma_i)), do you compute the arbitrage penalty (\mathcal A(\hat \sigma_i)) for each scenario and then assign weights**
+    [
+    w_i=\frac{e^{-\beta \mathcal A(\hat \sigma_i)}}{\sum_j e^{-\beta \mathcal A(\hat \sigma_j)}}?
+    ]
+
+
+23. **Are you treating the reweighted output as a discrete weighted empirical distribution over scenarios, not fitting a Gaussian to the weighted mean/covariance?** The paper uses weighted Monte Carlo, weighted expectations, and weighted quantiles. 
+
+24. **For a single next-day simulated path, are you sampling one scenario index (i) according to weights (w_i), rather than taking the mean surface?** Weighted expectation is for summaries; sampling is for scenario generation. 
+
+25. **For forecasts, are you computing weighted expectations and weighted quantiles from the sampled scenarios, not assuming normality around the expectation?** 
+
+26. **If you use reweighting, are you aware that the paper says raw outputs sometimes forecast better, while reweighting mainly reduces arbitrage?** This matters for reproducing results and deciding whether to use reweighting in hedging.
+
+## β calibration
+
+27. **Is β treated as day-specific, i.e. (\beta(t)), recalibrated for each prediction date / batch of generated scenarios?** The paper writes (\beta(t)), not one global fixed β. 
+
+28. **How exactly did you resolve the apparent circularity in**
+    [
+    \beta(t)=\frac{500}{\max_i w_i(t)}
+    ]
+    **since (w_i) themselves depend on β?** I want the code path spelled out explicitly. The paper states the heuristic, but your implementation must make the numerical procedure explicit. 
+
+29. **Did you implement a fixed-point iteration / one-step heuristic / root search for β, and can you justify it in code comments?** This is a point where repo and paper may not line up perfectly, so I want an explicit answer.
+
+30. **Do you monitor effective sample size or max weight after reweighting to avoid degeneracy?** This is not explicitly in the paper, but if the implementation ignores this, reweighting may collapse to a few particles.
+
+## Sampling count and forecasting
+
+31. **At inference, how many raw generator samples are produced per date?** The paper states (N=10000) raw samples. If you use fewer, quantify the trade-off and confirm whether the goal is mean forecast, quantiles, or single-scenario simulation. 
+
+32. **If generating forecasts for all test dates, are you batching over dates correctly, so one generator pass can produce one scenario for every test date simultaneously?** This is how the example implementation is typically structured.
+
+33. **When computing one-day-ahead confidence intervals, are you using weighted 2.5% and 97.5% quantiles from the scenario set, not parametric Gaussian bands?**
+
+## Arbitrage penalty
+
+34. **Did you implement the arbitrage penalty on relative call prices (c(m,\tau)), not directly on implied vols?** The penalty is defined via calendar, call, and butterfly violations in relative call price space. 
+
+35. **Are the three penalty components exactly the discrete positive-part formulas (p_1,p_2,p_3) from equations (3)-(5)?** 
+
+36. **Did you verify that (\mathcal A(\sigma)=0) corresponds to no static arbitrage on the grid?** 
+
+37. **Are you computing the penalty on the reconstructed surface (\hat \sigma), after exponentiating the reconstructed log surface, not on (\Delta \hat g)?**
+
+## Data preprocessing and smoothing
+
+38. **Did you smooth the raw implied vol data before training, using the Vega-weighted Nadaraya–Watson estimator with a 2D Gaussian kernel?** The GAN is trained on smoothed surfaces, not raw noisy quotes. 
+
+39. **Is the kernel exactly**
+    [
+    k(x,y)=\frac1{2\pi}\exp!\left(-\frac{x^2}{2h_1}-\frac{y^2}{2h_2}\right)?
+    ]
+
+
+40. **Are the smoothing weights proportional to Vega times the kernel, so high-Vega quotes matter more?** 
+
+41. **How did you choose (h_1,h_2)? Did you reproduce the grid search minimizing arbitrage penalty on a sample day, and if not, what did you replace it with?** The paper searches over ([0.002,0.1]) and reports ((h_1,h_2)=(0.002,0.046)). 
+
+42. **After smoothing, do you interpolate linearly in moneyness and then maturity, with linear extrapolation when needed?** 
+
+## Validation and sanity checks
+
+43. **Can you show me sample BCE-only outputs versus VolGAN outputs and confirm BCE-only surfaces are visibly rougher?** This is one of the paper’s qualitative sanity checks. 
+
+44. **Do the arbitrage penalties of raw VolGAN outputs have the same order of magnitude as the smoothed market inputs, and does reweighting reduce them further?** This reproduces a central result in Section 4.2.2. 
+
+45. **Did you verify that PCA of generated increments recovers the same broad factor structure as the data: first PC level, second PC skew?** That is a key dynamic validation target from the paper. 
+
+46. **Can you reproduce one-day-ahead forecast plots for ATM vols / SPX return / VIX using the weighted scenario distribution?**
+
+47. **Did you explicitly decide whether your downstream application should use raw outputs or reweighted outputs?** The paper’s hedging section finds raw outputs can be better for regression hedging, and they use 1000 samples there.
+
+## Repo-versus-paper reconciliation
+
+48. **Where does your code deliberately deviate from the paper?** I want a written list: β calibration procedure, number of inference samples, batching strategy, reweighting on/off, smoothing implementation, and whether you reproduced the repo or the paper when they differ.
+
+49. **For every ambiguity, did you choose “paper-first” or “repo-first”?** Spell this out explicitly.
+
+50. **Can you give me a table with columns: paper statement, code location, implemented exactly? yes/no, and if no, why?** That is the fastest way to audit correctness.
+
+If you want, I can turn this into a stricter handoff doc for the agent with acceptance criteria and failure conditions.
